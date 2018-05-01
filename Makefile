@@ -1,2 +1,2 @@
 all: 
-	g++ -Wall -Wextra -pedantic -g main.cpp -o main
+	g++ -Wall -Wextra -pedantic -g main.cpp -o socket
