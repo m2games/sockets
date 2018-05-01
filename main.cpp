@@ -3,8 +3,15 @@
 #include <netinet/in.h>
 #include <fcntl.h>
 #include <unistd.h> // close
+// getaddrinfo()
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
+// inet_ntop()
+#include <arpa/inet.h>
 //
 #include <stdio.h>
+#include <string.h>
 
 struct Address
 {
@@ -24,7 +31,7 @@ struct Address
     unsigned short port;
 };
 
-struct Socket
+struct UdpSocket
 {
     bool open(unsigned short port = 0);
     void close();
@@ -36,35 +43,83 @@ struct Socket
 
 int main()
 {
-    const int port = 30000;
-
-    Socket socket;
-    if(!socket.open(port))
-        return 0;
-
-    char sendData[] = {"Hello World UDP!!!"};
-    socket.send(Address(127, 0, 0, 1, port), sendData, sizeof(sendData)); 
-
-    while(true)
+    // UDP
     {
-        Address sender;
-        unsigned char buffer[256];
-        const int bytesRead = socket.receive(sender, buffer, sizeof(buffer));
+        const int port = 30000;
 
-        if(!bytesRead)
-            continue;
+        UdpSocket socket;
+        if(!socket.open(port))
+            return 0;
 
-        printf("received data (port %d)!: ", sender.port);
-        fwrite(buffer, bytesRead, 1, stdout);
-        printf("\n");
-        break;
+        char sendData[] = {"Hello World UDP!!!"};
+        socket.send(Address(127, 0, 0, 1, port), sendData, sizeof(sendData)); 
+
+        while(true)
+        {
+            Address sender;
+            unsigned char buffer[256];
+            const int bytesRead = socket.receive(sender, buffer, sizeof(buffer));
+
+            if(!bytesRead)
+                continue;
+
+            printf("received data (port %d)!: ", sender.port);
+            fwrite(buffer, bytesRead, 1, stdout);
+            printf("\n");
+            break;
+        }
+
+        socket.close();
     }
 
-    socket.close();
+    // TCP + getaddrinfo()
+
+    addrinfo hints;
+    addrinfo* res;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    const char* const hostname = "google.com";
+    const int status = getaddrinfo(hostname, nullptr, &hints, &res);
+    if(status != 0)
+    {
+        printf("getaddrinfo: %s\n", gai_strerror(status));
+        return 0;
+    }
+
+    printf("IP addresses for %s:\n", hostname);
+
+    for(addrinfo* it = res; it != nullptr; it = it->ai_next)
+    {
+        const void* addr;
+        const char* ipVersion;
+
+        if(it->ai_family == AF_INET)
+        {
+            sockaddr_in* ipv4 = (sockaddr_in*)it->ai_addr;
+            addr = &(ipv4->sin_addr);
+            ipVersion = "IPv4";
+        }
+        else
+        {
+            sockaddr_in6* ipv6 = (sockaddr_in6 *)it->ai_addr;
+            addr = &(ipv6->sin6_addr);
+            ipVersion = "IPv6";
+        }
+
+        char ipstr[INET6_ADDRSTRLEN];
+        inet_ntop(it->ai_family, addr, ipstr, sizeof(ipstr));
+        printf("%s: %s\n", ipVersion, ipstr);
+    }
+
+    freeaddrinfo(res);
+
     return 0;
 }
 
-bool Socket::open(unsigned short port)
+bool UdpSocket::open(unsigned short port)
 {
     handle = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     
@@ -98,12 +153,12 @@ bool Socket::open(unsigned short port)
     return true;
 }
 
-void Socket::close()
+void UdpSocket::close()
 {
     ::close(handle);
 }
 
-bool Socket::send(const Address& destination, const void* data, int size)
+bool UdpSocket::send(const Address& destination, const void* data, int size)
 {
     sockaddr_in addr;
     addr.sin_family = AF_INET;
@@ -122,7 +177,7 @@ bool Socket::send(const Address& destination, const void* data, int size)
     return true;
 }
 
-int Socket::receive(Address& sender, void* data, int size)
+int UdpSocket::receive(Address& sender, void* data, int size)
 {
     sockaddr_in addr;
     socklen_t length = sizeof(addr);
