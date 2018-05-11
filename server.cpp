@@ -1,9 +1,13 @@
 #include <stdio.h>
+#include <fcntl.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netdb.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <assert.h>
+#include <errno.h>
+#include <string.h>
 
 const void* get_in_addr(const sockaddr* const sa)
 {
@@ -52,6 +56,13 @@ int main()
             return 0;
         }
 
+        // set non-blocking
+        if(fcntl(sockfd, F_SETFL, O_NONBLOCK) == -1)
+        {
+            close(sockfd);
+            perror("fcntl() failed");
+            return 0;
+        }
 
         if(bind(sockfd, it->ai_addr, it->ai_addrlen) == -1)
         {
@@ -77,65 +88,125 @@ int main()
         return 0;
     }
 
-    sockaddr_storage clientAddr;
-    socklen_t clientAddrSize = sizeof(clientAddr);
-    const int clientSockfd = accept(sockfd, (sockaddr*)&clientAddr, &clientAddrSize);
+    // server loop
+    // @TODO(matiTechno): Client structure, keepalive, research select()
+    int clients[10];
+    int numClients = 0;
+    while(true)
+    {
+        // handle new client
+        {
+            sockaddr_storage clientAddr;
+            socklen_t clientAddrSize = sizeof(clientAddr);
+            const int client = accept(sockfd, (sockaddr*)&clientAddr, &clientAddrSize);
+
+            if(client == -1)
+            {
+                if(errno != EAGAIN || errno != EWOULDBLOCK)
+                    break;
+            }
+            else
+            {
+                // set non-blocking
+                if(fcntl(client, F_SETFL, O_NONBLOCK) == -1)
+                {
+                    close(client);
+                    perror("fcntl() on client failed");
+                }
+                else
+                {
+                    // replace with getSize()
+                    assert(numClients < int(sizeof(clients) / sizeof(int))); 
+                    clients[numClients] = client;
+                    ++numClients;
+
+                    // print client ip
+                    char name[INET6_ADDRSTRLEN];
+                    inet_ntop(clientAddr.ss_family, get_in_addr( (sockaddr*)&clientAddr ),
+                              name, sizeof(name));
+                    printf("accepted connection from %s\n", name);
+                }
+
+            }
+        }
+
+        // receive and send data
+        for(int i = 0; i < numClients; ++i)
+        {
+            bool remove = false;
+            int client = clients[i];
+            char buffer[512];
+            const int rc = recv(client, buffer, sizeof(buffer) - 1, 0);
+
+            if(rc == -1)
+            {
+                if(errno != EAGAIN || errno != EWOULDBLOCK)
+                {
+                    remove = true;
+                    perror("recv() failed");
+                }
+            }
+            else if(rc == 0)
+            {
+                remove = true;
+                printf("client has closed the connection\n");
+            }
+            else
+            {
+                // @TODO(matiTechno): what if msg is incomplete? (protocol)
+                buffer[rc] = '\0';
+                printf("received msg:\n%s\n", buffer);
+
+                // send html page
+
+                const char msg[] =
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/html\r\n\r\n"
+
+                "<!DOCTYPE html>"
+                "<html>"
+                "<body>"
+                "<h1>Welcome to the cavetiles server!</h1>"
+                "<p><a href=\"https://github.com/m2games\">company</a></p>"
+                "</body>"
+                "</html>";
+
+                // shadowing
+                const int rc = send(client, msg, sizeof(msg), 0);
+
+                if(rc == -1)
+                {
+                    remove = true;
+                    perror("send() failed");
+                }
+                else if(rc != sizeof(msg))
+                {
+                    // @TODO(matiTechno)
+                    printf("WARNING: only part of the msg has been sent!\n");
+                }
+
+                // without this browser does not display html
+                remove = true;
+            }
+
+            if(remove)
+            {
+                printf("removing client\n");
+                close(client);
+                clients[i] = clients[numClients - 1];
+                --numClients;
+                --i;
+            }
+        }
+
+        // sleep for some time
+        sleep(1);
+    }
+    
+    for(int i = 0; i < numClients; ++i)
+        close(clients[i]);
+
     close(sockfd);
-
-    if(clientSockfd == -1)
-    {
-        perror("accept() failed");
-        return 0;
-    }
-
-    // print client name
-    {
-        char name[INET6_ADDRSTRLEN];
-        inet_ntop(clientAddr.ss_family, get_in_addr( (sockaddr*)&clientAddr ), name,
-                  sizeof(name));
-        printf("accepted connection from %s\n", name);
-    }
-
-    // receive data
-    char buffer[512];
-    const int rc = recv(clientSockfd, buffer, sizeof(buffer) - 1, 0);
-
-    if(rc == -1)
-    {
-        perror("recv() failed");
-    }
-    else if(rc == 0)
-    {
-        printf("client has closed the connection\n");
-    }
-    else
-    {
-        buffer[rc] = '\0';
-        printf("received msg:\n%s\n", buffer);
-
-        // send html page
-
-        const char msg[] =
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: text/html\r\n\r\n"
-
-        "<!DOCTYPE html>"
-        "<html>"
-        "<body>"
-        "<h1>Welcome to the cavetiles server!</h1>"
-        "<p><a href=\"https://github.com/m2games\">company</a></p>"
-        "</body>"
-        "</html>";
-
-        // shadowing
-        const int rc = send(clientSockfd, msg, sizeof(msg), 0);
-
-        // @TODO(matiTechno): handle the case when not full data is sent
-        if(rc == -1)
-            perror("send() failed");
-    }
-
     printf("ending program with no critical errors\n");
-    close(clientSockfd);
     return 0;
 }
