@@ -25,7 +25,7 @@ int main()
         const int ec = getaddrinfo("localhost", "3000", &hints, &list);
         if(ec != 0)
         {
-            printf("getaddrinfo() failed: %s", gai_strerror(ec));
+            printf("getaddrinfo() failed: %s\n", gai_strerror(ec));
             return 0;
         }
     }
