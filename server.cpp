@@ -24,7 +24,6 @@ static volatile int gExitLoop = false;
 
 void sigHandler(int)
 {
-    // is this safe(correct)?
     gExitLoop = true;
 }
 
@@ -40,8 +39,9 @@ struct Client
     ClientStatus status = ClientStatus::Waiting;
     char name[20] = "dummy";
     int sockfd;
-    float timer = 0.f; // for tcp keepalive
     bool remove = false;
+
+    bool alive = true;
 };
 
 const char* getStatusStr(ClientStatus code)
@@ -52,9 +52,14 @@ const char* getStatusStr(ClientStatus code)
         case ClientStatus::Browser: return "Browser";
         case ClientStatus::Player:  return "Player";
     }
-
-    return "wrong status code";
+    assert(false);
 }
+
+struct Msg
+{
+    int clientIdx;
+    char buf[256];
+};
 
 int main()
 {
@@ -131,11 +136,42 @@ int main()
     }
 
     // server loop
-    // @TODO(matiTechno): keepalive
+    // note: don't change the order of operations
+    // (some logic is based on this)
+    float currentTime = 0.f;
+    float timer = 0.f;
     FixedArray<Client, 10> clients;
+    FixedArray<Msg, 50> msgQue;
     while(gExitLoop == false)
     {
-        // handle new client
+        // 1) update clients
+        {
+            const float newTime = currentTime + 1.f; // calculate this
+            const float dt = newTime - currentTime;
+            currentTime = newTime;
+            timer += dt;
+
+            if(timer > 5.f)
+            {
+                timer = 0.f;
+
+                for(int i = 0; i < clients.size(); ++i)
+                {
+                    Client& client = clients[i];
+                    {
+                        if(client.alive == false || client.status == ClientStatus::Waiting)
+                            client.remove = true;
+                        else
+                        {
+                            client.alive = false;
+                            msgQue.pushBack(Msg{i, "PING"});
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2) handle new client
         {
             sockaddr_storage clientAddr;
             socklen_t clientAddrSize = sizeof(clientAddr);
@@ -159,8 +195,7 @@ int main()
                 }
                 else
                 {
-                    assert(clients.size() < clients.maxSize());
-                    clients.pushBack(Client());
+                    clients.pushBack(Client()); // secured by the assert() in pushBack()
                     clients.back().sockfd = clientSockfd;
 
                     // print client ip
@@ -173,9 +208,11 @@ int main()
             }
         }
 
-        // receive data
-        for(Client& client: clients)
+        // 3) receive data
+        for(int i = 0; i < clients.size(); ++i)
         {
+            Client& client = clients[i];
+            // when set to 256 firefox has problems with the connection :D
             char buffer[512];
             const int rc = recv(client.sockfd, buffer, sizeof(buffer) - 1, 0);
 
@@ -195,6 +232,8 @@ int main()
             else
             {
                 // @TODO(matiTechno): what if msg is incomplete? (protocol)
+                // or two packets have been joined together under the hood
+                // (I don't know if it is possible)
                 buffer[rc] = '\0';
                 printf("received msg from '%s' (%s):\n%s\n", client.name,
                        getStatusStr(client.status), buffer);
@@ -203,65 +242,60 @@ int main()
                 {
                     // this is terrible I guess :D
                     if(strncmp(buffer, "GET", 3) == 0)
+                    {
                         client.status = ClientStatus::Browser;
+                        // without this browser does not display html
+                        client.remove = true;
+
+                        msgQue.pushBack(Msg{i,
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: text/html\r\n\r\n"
+                        "<!DOCTYPE html>"
+                        "<html>"
+                        "<body>"
+                        "<h1>Welcome to the cavetiles server!</h1>"
+                        "<p><a href=\"https://github.com/m2games\">company</a></p>"
+                        "</body>"
+                        "</html>"});
+                    }
                     else
                     {
                         // player name, name collisions, ...
                         client.status = ClientStatus::Player;
+                        msgQue.pushBack(Msg{i, "Hello cavetiles player!"});
                     }
                 }
+                else // status == Player
+                {
+                    if(strncmp(buffer, "PONG", 4) == 0)
+                        client.alive = true;
+
+                    else if(strncmp(buffer, "PING", 4) == 0)
+                        msgQue.pushBack(Msg{i, "PONG"});
+                }
             }
         }
 
-        // send data
-        for(Client& client: clients)
+        // 4) send data
+        for(Msg& msg: msgQue)
         {
-            const char* msg;
-            int msgSize = 0;
-
-            if(client.status == ClientStatus::Player)
+            Client& client = clients[msg.clientIdx];
+            // note: we send the entire buffer
+            const int rc = send(client.sockfd, msg.buf, sizeof(msg.buf), 0);
+            if(rc == -1)
             {
-                const char str[] = "Hello cavetiles client!";
-                msg = str;
-                msgSize = sizeof(str);
-            }
-            else if(client.status == ClientStatus::Browser)
-            {
-                // without this browser does not display html
                 client.remove = true;
-
-                const char str[] =
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Type: text/html\r\n\r\n"
-                "<!DOCTYPE html>"
-                "<html>"
-                "<body>"
-                "<h1>Welcome to the cavetiles server!</h1>"
-                "<p><a href=\"https://github.com/m2games\">company</a></p>"
-                "</body>"
-                "</html>";
-
-                msg = str;
-                msgSize = sizeof(str);
+                perror("send() failed");
             }
-            
-            if(msgSize)
+            else if(rc != sizeof(msg.buf))
             {
-                const int rc = send(client.sockfd, msg, msgSize, 0);
-                if(rc == -1)
-                {
-                    client.remove = true;
-                    perror("send() failed");
-                }
-                else if(rc != msgSize)
-                {
-                    // @TODO(matiTechno)
-                    printf("WARNING: only part of the msg has been sent!\n");
-                }
+                // @TODO(matiTechno)
+                printf("WARNING: only part of the msg has been sent!\n");
             }
         }
+        msgQue.clear();
 
-        // remove some clients
+        // 5) remove some clients
         for(int i = 0; i < clients.size(); ++i)
         {
             Client& client = clients[i];
@@ -277,8 +311,8 @@ int main()
             }
         }
 
-        // sleep for some time
-        sleep(1);
+        // 6) sleep for 10 ms
+        usleep(10000);
     }
     
     for(Client& client: clients)
