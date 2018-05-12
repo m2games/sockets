@@ -167,7 +167,11 @@ int main()
                     Client& client = clients[i];
                     {
                         if(client.alive == false || client.status == ClientStatus::Waiting)
+                        {
+                            printf("client '%s' (%s) will be removed (no PONG or init msg)\n",
+                                   client.name, getStatusStr(client.status));
                             client.remove = true;
+                        }
                         else
                         {
                             client.alive = false;
@@ -242,6 +246,7 @@ int main()
                 // @TODO(matiTechno): what if msg is incomplete? (protocol)
                 // or two packets have been joined together under the hood
                 // (I don't know if it is possible)
+                // THIS IS CRITICAL
                 buffer[rc] = '\0';
                 printf("received msg from '%s' (%s):\n%s\n", client.name,
                        getStatusStr(client.status), buffer);
