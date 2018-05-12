@@ -10,6 +10,8 @@
 #include <string.h>
 #include <signal.h>
 
+#include "Array.hpp"
+
 const void* get_in_addr(const sockaddr* const sa)
 {
     if(sa->sa_family == AF_INET)
@@ -24,6 +26,34 @@ void sigHandler(int)
 {
     // is this safe(correct)?
     gExitLoop = true;
+}
+
+enum class ClientStatus
+{
+    Waiting,
+    Browser,
+    Player
+};
+
+struct Client
+{
+    ClientStatus status = ClientStatus::Waiting;
+    char name[20] = "dummy";
+    int sockfd;
+    float timer = 0.f; // for tcp keepalive
+    bool remove = false;
+};
+
+const char* getStatusStr(ClientStatus code)
+{
+    switch(code)
+    {
+        case ClientStatus::Waiting: return "Waiting";
+        case ClientStatus::Browser: return "Browser";
+        case ClientStatus::Player:  return "Player";
+    }
+
+    return "wrong status code";
 }
 
 int main()
@@ -101,80 +131,108 @@ int main()
     }
 
     // server loop
-    // @TODO(matiTechno): Client structure, keepalive, research select()
-    int clients[10];
-    int numClients = 0;
+    // @TODO(matiTechno): keepalive
+    FixedArray<Client, 10> clients;
     while(gExitLoop == false)
     {
         // handle new client
         {
             sockaddr_storage clientAddr;
             socklen_t clientAddrSize = sizeof(clientAddr);
-            const int client = accept(sockfd, (sockaddr*)&clientAddr, &clientAddrSize);
+            const int clientSockfd = accept(sockfd, (sockaddr*)&clientAddr, &clientAddrSize);
 
-            if(client == -1)
+            if(clientSockfd == -1)
             {
                 if(errno != EAGAIN || errno != EWOULDBLOCK)
+                {
+                    perror("accept()");
                     break;
+                }
             }
             else
             {
                 // set non-blocking
-                if(fcntl(client, F_SETFL, O_NONBLOCK) == -1)
+                if(fcntl(clientSockfd, F_SETFL, O_NONBLOCK) == -1)
                 {
-                    close(client);
+                    close(clientSockfd);
                     perror("fcntl() on client failed");
                 }
                 else
                 {
-                    // replace with getSize()
-                    assert(numClients < int(sizeof(clients) / sizeof(int))); 
-                    clients[numClients] = client;
-                    ++numClients;
+                    assert(clients.size() < clients.maxSize());
+                    clients.pushBack(Client());
+                    clients.back().sockfd = clientSockfd;
 
                     // print client ip
-                    char name[INET6_ADDRSTRLEN];
+                    char ipStr[INET6_ADDRSTRLEN];
                     inet_ntop(clientAddr.ss_family, get_in_addr( (sockaddr*)&clientAddr ),
-                              name, sizeof(name));
-                    printf("accepted connection from %s\n", name);
+                              ipStr, sizeof(ipStr));
+                    printf("accepted connection from %s\n", ipStr);
                 }
 
             }
         }
 
-        // receive and send data
-        for(int i = 0; i < numClients; ++i)
+        // receive data
+        for(Client& client: clients)
         {
-            bool remove = false;
-            int client = clients[i];
             char buffer[512];
-            const int rc = recv(client, buffer, sizeof(buffer) - 1, 0);
+            const int rc = recv(client.sockfd, buffer, sizeof(buffer) - 1, 0);
 
             if(rc == -1)
             {
                 if(errno != EAGAIN || errno != EWOULDBLOCK)
                 {
-                    remove = true;
+                    client.remove = true;
                     perror("recv() failed");
                 }
             }
             else if(rc == 0)
             {
-                remove = true;
+                client.remove = true;
                 printf("client has closed the connection\n");
             }
             else
             {
                 // @TODO(matiTechno): what if msg is incomplete? (protocol)
                 buffer[rc] = '\0';
-                printf("received msg:\n%s\n", buffer);
+                printf("received msg from '%s' (%s):\n%s\n", client.name,
+                       getStatusStr(client.status), buffer);
 
-                // send html page
+                if(client.status == ClientStatus::Waiting)
+                {
+                    // this is terrible I guess :D
+                    if(strncmp(buffer, "GET", 3) == 0)
+                        client.status = ClientStatus::Browser;
+                    else
+                    {
+                        // player name, name collisions, ...
+                        client.status = ClientStatus::Player;
+                    }
+                }
+            }
+        }
 
-                const char msg[] =
+        // send data
+        for(Client& client: clients)
+        {
+            const char* msg;
+            int msgSize = 0;
+
+            if(client.status == ClientStatus::Player)
+            {
+                const char str[] = "Hello cavetiles client!";
+                msg = str;
+                msgSize = sizeof(str);
+            }
+            else if(client.status == ClientStatus::Browser)
+            {
+                // without this browser does not display html
+                client.remove = true;
+
+                const char str[] =
                 "HTTP/1.1 200 OK\r\n"
                 "Content-Type: text/html\r\n\r\n"
-
                 "<!DOCTYPE html>"
                 "<html>"
                 "<body>"
@@ -183,30 +241,38 @@ int main()
                 "</body>"
                 "</html>";
 
-                // shadowing
-                const int rc = send(client, msg, sizeof(msg), 0);
-
+                msg = str;
+                msgSize = sizeof(str);
+            }
+            
+            if(msgSize)
+            {
+                const int rc = send(client.sockfd, msg, msgSize, 0);
                 if(rc == -1)
                 {
-                    remove = true;
+                    client.remove = true;
                     perror("send() failed");
                 }
-                else if(rc != sizeof(msg))
+                else if(rc != msgSize)
                 {
                     // @TODO(matiTechno)
                     printf("WARNING: only part of the msg has been sent!\n");
                 }
-
-                // without this browser does not display html
-                remove = true;
             }
+        }
 
-            if(remove)
+        // remove some clients
+        for(int i = 0; i < clients.size(); ++i)
+        {
+            Client& client = clients[i];
+            if(client.remove)
             {
-                printf("removing client\n");
-                close(client);
-                clients[i] = clients[numClients - 1];
-                --numClients;
+                printf("removing client '%s' (%s)\n", client.name,
+                       getStatusStr(client.status));
+
+                close(client.sockfd);
+                client = clients.back();
+                clients.popBack();
                 --i;
             }
         }
@@ -215,8 +281,8 @@ int main()
         sleep(1);
     }
     
-    for(int i = 0; i < numClients; ++i)
-        close(clients[i]);
+    for(Client& client: clients)
+        close(client.sockfd);
 
     close(sockfd);
     printf("ending program with no critical errors\n");

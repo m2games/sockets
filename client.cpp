@@ -62,7 +62,7 @@ int main()
         return 0;
     }
 
-    const char request[] = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    const char request[] = "Hello! I'm cavetiles client!";
     const int rc = send(sockfd, request, sizeof(request), 0);
 
     // @TODO(matiTechno): handle the case when not full data is sent
