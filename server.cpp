@@ -9,8 +9,16 @@
 #include <errno.h>
 #include <string.h>
 #include <signal.h>
+#include <time.h>
 
 #include "Array.hpp"
+
+double getTimeSec()
+{
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1000000000.0;
+}
 
 const void* get_in_addr(const sockaddr* const sa)
 {
@@ -138,7 +146,7 @@ int main()
     // server loop
     // note: don't change the order of operations
     // (some logic is based on this)
-    float currentTime = 0.f;
+    double currentTime = getTimeSec();
     float timer = 0.f;
     FixedArray<Client, 10> clients;
     FixedArray<Msg, 50> msgQue;
@@ -146,10 +154,9 @@ int main()
     {
         // 1) update clients
         {
-            const float newTime = currentTime + 1.f; // calculate this
-            const float dt = newTime - currentTime;
+            const double newTime = getTimeSec(); // calculate this
+            timer += newTime - currentTime;
             currentTime = newTime;
-            timer += dt;
 
             if(timer > 5.f)
             {
