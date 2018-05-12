@@ -8,6 +8,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <string.h>
+#include <signal.h>
 
 const void* get_in_addr(const sockaddr* const sa)
 {
@@ -17,8 +18,19 @@ const void* get_in_addr(const sockaddr* const sa)
     return &( ( (sockaddr_in6*)sa )->sin6_addr );
 }
 
+static volatile int gExitLoop = false;
+
+void sigHandler(int)
+{
+    // is this safe(correct)?
+    gExitLoop = true;
+}
+
 int main()
 {
+    signal(SIGINT, sigHandler);
+    signal(SIGTERM, sigHandler);
+
     addrinfo hints = {};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -92,7 +104,7 @@ int main()
     // @TODO(matiTechno): Client structure, keepalive, research select()
     int clients[10];
     int numClients = 0;
-    while(true)
+    while(gExitLoop == false)
     {
         // handle new client
         {
