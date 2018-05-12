@@ -229,6 +229,7 @@ int main()
                 client.remove = true;
                 printf("client has closed the connection\n");
             }
+            // this is a mess :D (a little bit)
             else
             {
                 // @TODO(matiTechno): what if msg is incomplete? (protocol)
@@ -260,9 +261,43 @@ int main()
                     }
                     else
                     {
-                        // player name, name collisions, ...
-                        client.status = ClientStatus::Player;
-                        msgQue.pushBack(Msg{i, "Hello cavetiles player!"});
+                        bool ok = true;
+                        int nameBufSize = sizeof(client.name);
+                        // shadowing
+                        for(const Client& client: clients)
+                        {
+                            if(client.status != ClientStatus::Waiting &&
+                               strncmp(buffer, client.name, nameBufSize - 1) == 0)
+                            {
+                                ok = false;
+                                break;
+                            }
+                        }
+
+                        if(ok)
+                        {
+                            client.status = ClientStatus::Player;
+                            memcpy(client.name, buffer, nameBufSize - 1);
+                            client.name[nameBufSize - 1] = '\0';
+                            Msg msg;
+                            snprintf(msg.buf, sizeof(msg.buf), "'%s' has joined the game!",
+                                     client.name);
+
+                            for(int j = 0; j < clients.size(); ++j)
+                            {
+                                if(clients[j].status == ClientStatus::Player)
+                                {
+                                    msg.clientIdx = j;
+                                    msgQue.pushBack(msg);
+                                }
+                            }
+                        }
+                        else
+                        {
+                            // @TODO(matiTechno): client will be disconnected in the update
+                            msgQue.pushBack(Msg{i, "NAME"});
+                        }
+
                     }
                 }
                 else // status == Player
@@ -272,11 +307,49 @@ int main()
 
                     else if(strncmp(buffer, "PING", 4) == 0)
                         msgQue.pushBack(Msg{i, "PONG"});
+
+                    else if(strncmp(buffer, "CHAT", 4) == 0)
+                    {
+                        // forward msg to all players
+                        // this might be not efficient
+                        Msg msg;
+                        // might truncate I guess
+                        snprintf(msg.buf, sizeof(msg.buf), "%s: %s\n", client.name,
+                                 buffer + 5);
+
+                        for(int j = 0; j < clients.size(); ++j)
+                        {
+                            if(clients[i].status == ClientStatus::Player)
+                            {
+                                msg.clientIdx = j;
+                                msgQue.pushBack(msg);
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        // 4) send data
+        // 4) inform players if someone will leave the game
+        for(const Client& client: clients)
+        {
+            if(client.remove && client.status == ClientStatus::Player)
+            {
+                Msg msg;
+                snprintf(msg.buf, sizeof(msg), "'%s' has left", client.name);
+
+                for(int i = 0; i < clients.size(); ++i)
+                {
+                    if(clients[i].status == ClientStatus::Player)
+                    {
+                        msg.clientIdx = i;
+                        msgQue.pushBack(msg);
+                    }
+                }
+            }
+        }
+
+        // 5) send data
         for(Msg& msg: msgQue)
         {
             Client& client = clients[msg.clientIdx];
@@ -295,7 +368,7 @@ int main()
         }
         msgQue.clear();
 
-        // 5) remove some clients
+        // 6) remove some clients
         for(int i = 0; i < clients.size(); ++i)
         {
             Client& client = clients[i];
@@ -311,7 +384,7 @@ int main()
             }
         }
 
-        // 6) sleep for 10 ms
+        // 7) sleep for 10 ms
         usleep(10000);
     }
     
