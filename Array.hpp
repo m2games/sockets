@@ -57,7 +57,7 @@ public:
 
     T& erase(int i, int count)
     {
-        memmove(data_ + i, data_ + i + count, size_ - count);
+        memmove(data_ + i, data_ + i + count, size_ - i - count);
         size_ -= count;
         return data_[i];
     }
