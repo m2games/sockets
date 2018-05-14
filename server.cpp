@@ -10,6 +10,7 @@
 #include <string.h>
 #include <signal.h>
 #include <time.h>
+#include <netinet/tcp.h>
 
 #include "Array.hpp"
 
@@ -107,7 +108,14 @@ int main()
         if(setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option)) == -1)
         {
             close(sockfd);
-            perror("setsockopt() failed");
+            perror("setsockopt() (SO_REUSEADDR) failed");
+            return 0;
+        }
+
+        if(setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &option, sizeof(option)) == -1)
+        {
+            close(sockfd);
+            perror("setsockopt() (TCP_NODELAY) failed");
             return 0;
         }
 

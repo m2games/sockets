@@ -9,6 +9,7 @@
 #include <string.h>
 #include <fcntl.h>
 #include <time.h>
+#include <netinet/tcp.h>
 
 #include "Array.hpp"
 
@@ -104,6 +105,16 @@ int main(int argc, const char* const * const argv)
         close(sockfd);
         perror("fcntl() failed");
         return 0;
+    }
+
+    {
+        const int option = 1;
+        if(setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &option, sizeof(option)) == -1)
+        {
+            close(sockfd);
+            perror("setsockopt() (TCP_NODELAY) failed");
+            return 0;
+        }
     }
 
     bool serverAlive = true;
