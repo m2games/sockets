@@ -10,7 +10,6 @@
 #include <fcntl.h>
 #include <time.h>
 #include <netinet/tcp.h>
-
 #include "Array.hpp"
 
 double getTimeSec()
@@ -28,17 +27,42 @@ const void* get_in_addr(const sockaddr* const sa)
     return &( ( (sockaddr_in6*)sa )->sin6_addr );
 }
 
-static volatile int gExitLoop = false;
-
-void sigHandler(int)
+struct Cmd
 {
-    gExitLoop = true;
+    enum
+    {
+        _nil,
+        Ping,
+        Pong,
+        Name,
+        Chat,
+        _count
+    };
+};
+
+const char* getCmdStr(int cmd)
+{
+    switch(cmd)
+    {
+        case Cmd::Ping: return "PING";
+        case Cmd::Pong: return "PONG";
+        case Cmd::Name: return "NAME";
+        case Cmd::Chat: return "CHAT";
+    }
+    assert(false);
 }
 
-struct Msg
+void addMsg(Array<char>& buffer, int cmd, const char* payload = "")
 {
-    char buf[256];
-};
+    const char* cmdStr = getCmdStr(cmd);
+    int len = strlen(cmdStr) + strlen(payload) + 2; // ' ' + '\0'
+    int prevSize = buffer.size();
+    buffer.resize(prevSize + len);
+    assert(snprintf(buffer.data() + prevSize, len, "%s %s", cmdStr, payload) == len - 1);
+}
+
+static volatile int gExitLoop = false;
+void sigHandler(int) {gExitLoop = true;}
 
 int main(int argc, const char* const * const argv)
 {
@@ -50,8 +74,7 @@ int main(int argc, const char* const * const argv)
 
     signal(SIGINT, sigHandler);
 
-    // @TODO(matiTechno): client should be able to reconnect - move all the connect code
-    // to the main loop
+    // @TODO(matiTechno): client should be able to reconnect in the main loop
     addrinfo hints = {};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -99,7 +122,6 @@ int main(int argc, const char* const * const argv)
         return 0;
     }
 
-    // set non-blocking
     if(fcntl(sockfd, F_SETFL, O_NONBLOCK) == -1)
     {
         close(sockfd);
@@ -117,52 +139,65 @@ int main(int argc, const char* const * const argv)
         }
     }
 
+    Array<char> sendBuf, recvBuf;
+    int recvBufNumUsed = 0;
+    sendBuf.reserve(500);
+    recvBuf.resize(500);
     bool serverAlive = true;
-    FixedArray<Msg, 10> sendQue;
     double currentTime = getTimeSec();
     float timerAlive = 0.f, timerSend = 0.f;
 
-    // send the client name first
-    sendQue.pushBack(Msg{});
-    strncpy(sendQue.back().buf, argv[1], sizeof(sendQue.back().buf));
+    // send the player name
+    {
+        char name[20];
+        int maxNameSize = sizeof(name) - 1;
+
+        if(int(strlen(argv[1])) > maxNameSize)
+            printf("WARNING: max player name size is %d, truncating\n", maxNameSize);
+
+        snprintf(name, sizeof(name), "%s", argv[1]);
+        addMsg(sendBuf, Cmd::Name, name);
+    }
 
     //@TODO(matiTechno): never exit the loop on error (always try to reconnect)
     while(gExitLoop == false)
     {
-        double newTime = getTimeSec();
-        const float dt = newTime - currentTime;
-        currentTime = newTime;
-        timerAlive += dt;
-        timerSend += dt;
-
-        if(timerAlive > 5.f)
+        // update
         {
-            timerAlive = 0.f;
+            double newTime = getTimeSec();
+            const float dt = newTime - currentTime;
+            currentTime = newTime;
+            timerAlive += dt;
+            timerSend += dt;
 
-            if(serverAlive)
+            if(timerAlive > 5.f)
             {
-                serverAlive = false;
-                sendQue.pushBack(Msg{"PING"});
-            }
-            else
-            {
-                gExitLoop = true;
-                printf("no PONG response from server\n");
-            }
-        }
+                timerAlive = 0.f;
 
-        if(timerSend > 10.f)
-        {
-            timerSend = 0.f;
-            sendQue.pushBack(Msg{"CHAT I send a random message every 10 s!"});
+                if(serverAlive)
+                {
+                    serverAlive = false;
+                    addMsg(sendBuf, Cmd::Ping);
+                }
+                else
+                {
+                    gExitLoop = true;
+                    printf("no PONG response from server\n");
+                }
+            }
+
+            if(timerSend > 10.f)
+            {
+                timerSend = 0.f;
+                addMsg(sendBuf, Cmd::Chat, "I send a random message every 10s!");
+            }
         }
 
         // receive
+        while(true)
         {
-            char buffer[512];
-
-            // we need some protocol for this, see server.c receive() code for more notes
-            int rc = recv(sockfd, buffer, sizeof(buffer) - 1, 0);
+            const int numFree = recvBuf.size() - recvBufNumUsed;
+            const int rc = recv(sockfd, recvBuf.data() + recvBufNumUsed, numFree, 0);
 
             if(rc == -1)
             {
@@ -171,61 +206,118 @@ int main(int argc, const char* const * const argv)
                     perror("recv() failed");
                     gExitLoop = true;
                 }
+                break;
             }
             else if(rc == 0)
             {
                 printf("server has closed the connection\n");
                 gExitLoop = true;
+                break;
             }
             else
             {
-                buffer[rc] = '\0';
+                recvBufNumUsed += rc;
 
-                if(strncmp(buffer, "PING", 4) == 0)
-                    sendQue.pushBack(Msg{"PONG"});
+                if(recvBufNumUsed < recvBuf.size())
+                    break;
 
-                else if(strncmp(buffer, "PONG", 4) == 0)
-                    serverAlive = true;
-
-                else if(strncmp(buffer, "NAME", 4) == 0)
+                recvBuf.resize(recvBuf.size() * 2);
+                if(recvBuf.size() > 10000)
                 {
+                    printf("recvBuf big size issue, exiting\n");
                     gExitLoop = true;
-                    printf("name already in use, try something different\n");
+                    break;
+                }
+            }
+        }
+
+        // process received data
+        {
+            const char* end = recvBuf.data();
+            const char* begin;
+
+            while(true)
+            {
+                begin = end;
+                {
+                    const char* tmp = (const char*)memchr((const void*)end, '\0',
+                                       recvBuf.data() + recvBufNumUsed - end);
+
+                    if(tmp == nullptr) break;
+                    end = tmp;
                 }
 
-                else
-                    printf("received msg:\n%s\n", buffer);
+                ++end;
+
+                printf("received msg: '%s'\n", begin);
+
+                int cmd = 0;
+                for(int i = 1; i < Cmd::_count; ++i)
+                {
+                    const char* const cmdStr = getCmdStr(i);
+                    const int cmdLen = strlen(cmdStr);
+
+                    if(int(strlen(begin)) >= cmdLen)
+                        continue;
+
+                    if(strncmp(begin, cmdStr, cmdLen) == 0)
+                    {
+                        cmd = i;
+                        begin += cmdLen + 1; // ' '
+                        break;
+                    }
+                }
+
+                switch(cmd)
+                {
+                    case 0:
+                        printf("WARNING unknown command received: '%s'\n", begin);
+                        break;
+
+                    case Cmd::Ping:
+                        addMsg(sendBuf, cmd);
+                        break;
+
+                    case Cmd::Pong:
+                        serverAlive = true;
+                        break;
+
+                    case Cmd::Name:
+                        gExitLoop = true;
+                        printf("name already in use, try something different\n");
+                        break;
+
+                    case Cmd::Chat:
+                        printf("%s\n", begin);
+                        break;
+                }
             }
+
+            const int numToFree = end - recvBuf.data();
+            memmove(recvBuf.data(), recvBuf.data() + numToFree, recvBufNumUsed - numToFree);
+            recvBufNumUsed -= numToFree;
         }
 
         // send
-        // @TODO(matiTechno): handle the case when not full data is sent
-        // note: we are sending the entire buffer (even if not used)
+        if(sendBuf.size())
         {
-            for(const Msg& msg: sendQue)
-            {
-                const int msgSize = sizeof(msg.buf);
-                const int rc = send(sockfd, msg.buf, msgSize, 0);
+            const int rc = send(sockfd, sendBuf.data(), sendBuf.size(), 0);
 
-                if(rc == -1)
-                {
-                    close(sockfd);
-                    perror("send() failed");
-                    return 0;
-                }
-                else if(rc != msgSize)
-                {
-                    printf("WARNING: only part of the msg has been sent!\n");
-                }
+            if(rc == -1)
+            {
+                close(sockfd);
+                perror("send() failed");
+                return 0;
             }
+            else
+                sendBuf.erase(0, rc);
         }
-        sendQue.clear();
 
         // sleep for 10 ms
         usleep(10000);
     }
 
-    printf("ending program with no critical errors\n");
+    printf("end of the main function\n");
     close(sockfd);
     return 0;
 }

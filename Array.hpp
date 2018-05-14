@@ -49,11 +49,16 @@ public:
         return data_[i];
     }
     
-    // @ not tested
+    // @TODO(matiTechno): return iterator not reference
     T& erase(int i)
     {
-        memmove(data_ + i, data_ + i + 1, size_ - i - 1);
-        --size_;
+        return erase(i, 1);
+    }
+
+    T& erase(int i, int count)
+    {
+        memmove(data_ + i, data_ + i + count, size_ - count);
+        size_ -= count;
         return data_[i];
     }
 
