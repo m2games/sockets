@@ -14,6 +14,21 @@ public:
     Array(const Array<T>&) = delete;
     Array<T>& operator=(const Array<T>&) = delete;
 
+    void swap(Array<T>& other)
+    {
+        int size = other.size_;
+        int capacity = other.capacity_;
+        T* data = other.data_;
+
+        other.size_ = size_;
+        other.capacity_ = capacity_;
+        other.data_ = data_;
+
+        size_ = size;
+        capacity_ = capacity;
+        data_ = data;
+    }
+
     void pushBack(const T& val)
     {
         ++size_;

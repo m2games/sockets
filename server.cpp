@@ -11,8 +11,10 @@
 #include <signal.h>
 #include <time.h>
 #include <netinet/tcp.h>
-
 #include "Array.hpp"
+
+template<typename T>
+T min(T l, T r) {return l > r ? r : l;}
 
 double getTimeSec()
 {
@@ -29,18 +31,57 @@ const void* get_in_addr(const sockaddr* const sa)
     return &( ( (sockaddr_in6*)sa )->sin6_addr );
 }
 
-static volatile int gExitLoop = false;
-
-void sigHandler(int)
+struct Cmd
 {
-    gExitLoop = true;
+    enum
+    {
+        _nil,
+        Ping,
+        Pong,
+        Name,
+        Chat,
+        _count
+    };
+};
+
+const char* getCmdStr(int cmd)
+{
+    switch(cmd)
+    {
+        case Cmd::Ping: return "PING";
+        case Cmd::Pong: return "PONG";
+        case Cmd::Name: return "NAME";
+        case Cmd::Chat: return "CHAT";
+    }
+    assert(false);
+}
+
+void addMsg(Array<char>& buffer, int cmd, const char* payload = "")
+{
+    if(cmd)
+    {
+        const char* cmdStr = getCmdStr(cmd);
+        int len = strlen(cmdStr) + strlen(payload) + 2; // ' ' + '\0'
+        int prevSize = buffer.size();
+        buffer.resize(prevSize + len);
+        assert(snprintf(buffer.data() + prevSize, len, "%s %s", cmdStr, payload) == len - 1);
+    }
+    // special case for http response
+    else
+    {
+        int len = strlen(payload) + 1;
+        int prevSize = buffer.size();
+        buffer.resize(prevSize + len);
+        memcpy(buffer.data() + prevSize, payload, len);
+    }
 }
 
 enum class ClientStatus
 {
     Waiting,
     Browser,
-    Player
+    Player,
+    PlayerRename
 };
 
 struct Client
@@ -49,7 +90,6 @@ struct Client
     char name[20] = "dummy";
     int sockfd;
     bool remove = false;
-
     bool alive = true;
 };
 
@@ -60,15 +100,13 @@ const char* getStatusStr(ClientStatus code)
         case ClientStatus::Waiting: return "Waiting";
         case ClientStatus::Browser: return "Browser";
         case ClientStatus::Player:  return "Player";
+        case ClientStatus::PlayerRename: return "PlayerRename";
     }
     assert(false);
 }
 
-struct Msg
-{
-    int clientIdx;
-    char buf[256];
-};
+static volatile int gExitLoop = false;
+void sigHandler(int) {gExitLoop = true;}
 
 int main()
 {
@@ -103,7 +141,6 @@ int main()
             continue;
         }
 
-        // reuse the port
         const int option = 1;
         if(setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option)) == -1)
         {
@@ -112,14 +149,6 @@ int main()
             return 0;
         }
 
-        if(setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &option, sizeof(option)) == -1)
-        {
-            close(sockfd);
-            perror("setsockopt() (TCP_NODELAY) failed");
-            return 0;
-        }
-
-        // set non-blocking
         if(fcntl(sockfd, F_SETFL, O_NONBLOCK) == -1)
         {
             close(sockfd);
@@ -151,18 +180,29 @@ int main()
         return 0;
     }
 
+    constexpr int maxClients = 10;
+    FixedArray<Client, maxClients> clients;
+    Array<char> sendBufs[maxClients];
+    Array<char> recvBufs[maxClients];
+    int recvBufsNumUsed[maxClients];
+
+    for(int i = 0; i < maxClients; ++i)
+    {
+        sendBufs[i].reserve(500);
+        recvBufs[i].resize(500);
+    }
+
+    double currentTime = getTimeSec();
+    float timer = 0.f;
+
     // server loop
     // note: don't change the order of operations
     // (some logic is based on this)
-    double currentTime = getTimeSec();
-    float timer = 0.f;
-    FixedArray<Client, 10> clients;
-    FixedArray<Msg, 50> msgQue;
     while(gExitLoop == false)
     {
-        // 1) update clients
+        // update clients
         {
-            const double newTime = getTimeSec(); // calculate this
+            const double newTime = getTimeSec();
             timer += newTime - currentTime;
             currentTime = newTime;
 
@@ -173,24 +213,23 @@ int main()
                 for(int i = 0; i < clients.size(); ++i)
                 {
                     Client& client = clients[i];
+
+                    if(client.alive == false)
                     {
-                        if(client.alive == false || client.status == ClientStatus::Waiting)
-                        {
-                            printf("client '%s' (%s) will be removed (no PONG or init msg)\n",
-                                   client.name, getStatusStr(client.status));
-                            client.remove = true;
-                        }
-                        else
-                        {
-                            client.alive = false;
-                            msgQue.pushBack(Msg{i, "PING"});
-                        }
+                        printf("client '%s' (%s) will be removed (no PONG or init msg)\n",
+                               client.name, getStatusStr(client.status));
+                        client.remove = true;
                     }
+                    else if(client.status != ClientStatus::Waiting)
+                        addMsg(sendBufs[i], Cmd::Ping);
+
+                    client.alive = false;
                 }
             }
         }
 
-        // 2) handle new client
+        // handle new client
+        if(clients.size() < clients.maxSize())
         {
             sockaddr_storage clientAddr;
             socklen_t clientAddrSize = sizeof(clientAddr);
@@ -206,16 +245,25 @@ int main()
             }
             else
             {
-                // set non-blocking
+                const int option = 1;
+
                 if(fcntl(clientSockfd, F_SETFL, O_NONBLOCK) == -1)
                 {
                     close(clientSockfd);
                     perror("fcntl() on client failed");
                 }
+                else if(setsockopt(clientSockfd, IPPROTO_TCP, TCP_NODELAY, &option,
+                                   sizeof(option)) == -1)
+                {
+                    close(clientSockfd);
+                    perror("setsockopt() (TCP_NODELAY) on client failed");
+                }
                 else
                 {
-                    clients.pushBack(Client()); // secured by the assert() in pushBack()
+                    clients.pushBack(Client());
                     clients.back().sockfd = clientSockfd;
+                    sendBufs[clients.size() - 1].clear();
+                    recvBufsNumUsed[clients.size() - 1] = 0;
 
                     // print client ip
                     char ipStr[INET6_ADDRSTRLEN];
@@ -227,67 +275,140 @@ int main()
             }
         }
 
-        // 3) receive data
+        // receive
         for(int i = 0; i < clients.size(); ++i)
         {
+            Array<char>& recvBuf = recvBufs[i];
+            int& recvBufNumUsed = recvBufsNumUsed[i];
             Client& client = clients[i];
-            // when set to 256 firefox has problems with the connection :D
-            char buffer[512];
-            const int rc = recv(client.sockfd, buffer, sizeof(buffer) - 1, 0);
 
-            if(rc == -1)
+            while(true)
             {
-                if(errno != EAGAIN || errno != EWOULDBLOCK)
+                const int numFree = recvBuf.size() - recvBufNumUsed;
+                const int rc = recv(client.sockfd, recvBuf.data() + recvBufNumUsed,
+                                    numFree, 0);
+
+                if(rc == -1)
                 {
+                    if(errno != EAGAIN || errno != EWOULDBLOCK)
+                    {
+                        perror("recv() failed");
+                        client.remove = true;
+                    }
+                    break;
+                }
+                else if(rc == 0)
+                {
+                    printf("client has closed the connection\n");
                     client.remove = true;
-                    perror("recv() failed");
+                    break;
+                }
+                else
+                {
+                    recvBufNumUsed += rc;
+
+                    if(recvBufNumUsed < recvBuf.size())
+                        break;
+
+                    recvBuf.resize(recvBuf.size() * 2);
+                    if(recvBuf.size() > 10000)
+                    {
+                        printf("recvBuf big size issue, removing client: '%s' (%s)\n",
+                               client.name, getStatusStr(client.status));
+                        client.remove = true;
+                        break;
+                    }
                 }
             }
-            else if(rc == 0)
-            {
-                client.remove = true;
-                printf("client has closed the connection\n");
-            }
-            // this is a mess :D (a little bit)
-            else
-            {
-                // @TODO(matiTechno): what if msg is incomplete? (protocol)
-                // or two packets have been joined together under the hood
-                // (I don't know if it is possible)
-                // THIS IS CRITICAL
-                buffer[rc] = '\0';
-                printf("received msg from '%s' (%s):\n%s\n", client.name,
-                       getStatusStr(client.status), buffer);
+        }
 
-                if(client.status == ClientStatus::Waiting)
+        // process received data
+        for(int i = 0; i < clients.size(); ++i)
+        {
+            Array<char>& sendBuf = sendBufs[i];
+            Array<char>& recvBuf = recvBufs[i];
+            int& recvBufNumUsed = recvBufsNumUsed[i];
+            Client& client = clients[i];
+
+            const char* end = recvBuf.data();
+            const char* begin;
+
+            // special case for http
+            if(recvBufNumUsed >= 3)
+            {
+                const char* const cmd = "GET";
+                if(strncmp(cmd, recvBuf.data(), strlen(cmd)) == 0)
                 {
-                    // this is terrible I guess :D
-                    if(strncmp(buffer, "GET", 3) == 0)
-                    {
-                        client.status = ClientStatus::Browser;
-                        // without this browser does not display html
-                        client.remove = true;
+                    client.status = ClientStatus::Browser;
+                    addMsg(sendBuf, Cmd::_nil,
+                            "HTTP/1.1 200 OK\r\n"
+                            "Content-Type: text/html\r\n\r\n"
+                            "<!DOCTYPE html>"
+                            "<html>"
+                            "<body>"
+                            "<h1>Welcome to the cavetiles server!</h1>"
+                            "<p><a href=\"https://github.com/m2games\">company</a></p>"
+                            "</body>"
+                            "</html>");
+                    continue;
+                }
+            }
 
-                        msgQue.pushBack(Msg{i,
-                        "HTTP/1.1 200 OK\r\n"
-                        "Content-Type: text/html\r\n\r\n"
-                        "<!DOCTYPE html>"
-                        "<html>"
-                        "<body>"
-                        "<h1>Welcome to the cavetiles server!</h1>"
-                        "<p><a href=\"https://github.com/m2games\">company</a></p>"
-                        "</body>"
-                        "</html>"});
+            while(true)
+            {
+                begin = end;
+                {
+                    const char* tmp = (const char*)memchr((const void*)end, '\0',
+                                       recvBuf.data() + recvBufNumUsed - end);
+
+                    if(tmp == nullptr) break;
+                    end = tmp;
+                }
+
+                ++end;
+
+                printf("'%s' (%s) received msg: '%s'\n", client.name,
+                                                         getStatusStr(client.status), begin);
+
+                int cmd = 0;
+                for(int i = 1; i < Cmd::_count; ++i)
+                {
+                    const char* const cmdStr = getCmdStr(i);
+                    const int cmdLen = strlen(cmdStr);
+
+                    if(cmdLen > int(strlen(begin)))
+                        continue;
+
+                    if(strncmp(begin, cmdStr, cmdLen) == 0)
+                    {
+                        cmd = i;
+                        begin += cmdLen + 1; // ' '
+                        break;
                     }
-                    else
+                }
+
+                switch(cmd)
+                {
+                    case 0:
+                        printf("WARNING unknown command received: '%s'\n", begin);
+                        break;
+
+                    case Cmd::Ping:
+                        addMsg(sendBuf, Cmd::Pong);
+                        break;
+
+                    case Cmd::Pong:
+                        client.alive = true;
+                        break;
+
+                    case Cmd::Name:
                     {
                         bool ok = true;
-                        int nameBufSize = sizeof(client.name);
-                        // shadowing
-                        for(const Client& client: clients)
+
+                        for(const Client& other: clients)
                         {
-                            if(client.status != ClientStatus::Waiting &&
-                               strncmp(buffer, client.name, nameBufSize - 1) == 0)
+                            if(other.status == ClientStatus::Player &&
+                               strcmp(other.name, begin) == 0)
                             {
                                 ok = false;
                                 break;
@@ -297,114 +418,114 @@ int main()
                         if(ok)
                         {
                             client.status = ClientStatus::Player;
-                            memcpy(client.name, buffer, nameBufSize - 1);
-                            client.name[nameBufSize - 1] = '\0';
-                            Msg msg;
-                            snprintf(msg.buf, sizeof(msg.buf), "'%s' has joined the game!",
-                                     client.name);
+                            const int maxSize = sizeof(client.name);
 
-                            for(int j = 0; j < clients.size(); ++j)
+                            memcpy(client.name, begin, min(maxSize, int(strlen(begin)) + 1));
+                            client.name[maxSize - 1] = '\0';
+
+                            for(int i = 0; i < clients.size(); ++i)
                             {
-                                if(clients[j].status == ClientStatus::Player)
+                                if(clients[i].status == ClientStatus::Player)
                                 {
-                                    msg.clientIdx = j;
-                                    msgQue.pushBack(msg);
+                                    char msg[64];
+                                    snprintf(msg, sizeof(msg), "'%s' has joined the game!",
+                                             client.name);
+
+                                    addMsg(sendBufs[i], Cmd::Chat, msg);
                                 }
                             }
                         }
                         else
                         {
-                            // @TODO(matiTechno): client will be disconnected in the update
-                            msgQue.pushBack(Msg{i, "NAME"});
+                            client.status = ClientStatus::PlayerRename;
+                            addMsg(sendBuf, Cmd::Name);
                         }
 
+                        break;
                     }
-                }
-                else // status == Player
-                {
-                    if(strncmp(buffer, "PONG", 4) == 0)
-                        client.alive = true;
 
-                    else if(strncmp(buffer, "PING", 4) == 0)
-                        msgQue.pushBack(Msg{i, "PONG"});
-
-                    else if(strncmp(buffer, "CHAT", 4) == 0)
-                    {
-                        // forward msg to all players
-                        // this might be not efficient
-                        Msg msg;
-                        // might truncate I guess
-                        snprintf(msg.buf, sizeof(msg.buf), "%s: %s\n", client.name,
-                                 buffer + 5);
-
-                        for(int j = 0; j < clients.size(); ++j)
+                    case Cmd::Chat:
+                        for(int i = 0; i < clients.size(); ++i)
                         {
                             if(clients[i].status == ClientStatus::Player)
                             {
-                                msg.clientIdx = j;
-                                msgQue.pushBack(msg);
+                                char msg[512];
+                                snprintf(msg, sizeof(msg), "%s: %s", client.name, begin);
+                                addMsg(sendBufs[i], Cmd::Chat, msg);
                             }
                         }
-                    }
+                        break;
                 }
             }
+
+            const int numToFree = end - recvBuf.data();
+            memmove(recvBuf.data(), recvBuf.data() + numToFree, recvBufNumUsed - numToFree);
+            recvBufNumUsed -= numToFree;
         }
 
-        // 4) inform players if someone will leave the game
+        // inform players if someone will leave the game
         for(const Client& client: clients)
         {
             if(client.remove && client.status == ClientStatus::Player)
             {
-                Msg msg;
-                snprintf(msg.buf, sizeof(msg), "'%s' has left", client.name);
+                char buf[64];
+                snprintf(buf, sizeof(buf), "'%s' has left", client.name);
 
                 for(int i = 0; i < clients.size(); ++i)
                 {
-                    if(clients[i].status == ClientStatus::Player)
+                    if(clients[i].status == ClientStatus::Player && !clients[i].remove)
                     {
-                        msg.clientIdx = i;
-                        msgQue.pushBack(msg);
+                        addMsg(sendBufs[i], Cmd::Chat, buf);
                     }
                 }
             }
         }
 
-        // 5) send data
-        for(Msg& msg: msgQue)
+        // send
+        for(int i = 0; i < clients.size(); ++i)
         {
-            Client& client = clients[msg.clientIdx];
-            // note: we send the entire buffer
-            const int rc = send(client.sockfd, msg.buf, sizeof(msg.buf), 0);
-            if(rc == -1)
+            if(clients[i].remove)
+                continue;
+
+            Array<char>& buf = sendBufs[i];
+            if(buf.size())
             {
-                client.remove = true;
-                perror("send() failed");
-            }
-            else if(rc != sizeof(msg.buf))
-            {
-                // @TODO(matiTechno)
-                printf("WARNING: only part of the msg has been sent!\n");
+                const int rc = send(clients[i].sockfd, buf.data(), buf.size(), 0);
+
+                if(rc == -1)
+                {
+                    perror("send() failed");
+                    clients[i].remove = true;
+                }
+                else
+                    buf.erase(0, rc);
             }
         }
-        msgQue.clear();
 
-        // 6) remove some clients
+        // remove some clients
         for(int i = 0; i < clients.size(); ++i)
         {
             Client& client = clients[i];
-            if(client.remove)
+            if(client.remove || client.status == ClientStatus::Browser)
             {
                 printf("removing client '%s' (%s)\n", client.name,
                        getStatusStr(client.status));
 
                 close(client.sockfd);
+
                 client = clients.back();
+
+                const int lastIdx = clients.size() - 1;
+                sendBufs[i].swap(sendBufs[lastIdx]);
+                recvBufs[i].swap(recvBufs[lastIdx]);
+                recvBufsNumUsed[i] = recvBufsNumUsed[lastIdx];
+
                 clients.popBack();
                 --i;
             }
         }
 
-        // 7) sleep for 10 ms
+        // sleep for 10 ms
         usleep(10000);
     }
     
@@ -412,6 +533,6 @@ int main()
         close(client.sockfd);
 
     close(sockfd);
-    printf("ending program with no critical errors\n");
+    printf("end of the main function\n");
     return 0;
 }

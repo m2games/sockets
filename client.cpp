@@ -75,6 +75,8 @@ int main(int argc, const char* const * const argv)
     signal(SIGINT, sigHandler);
 
     // @TODO(matiTechno): client should be able to reconnect in the main loop
+    // remove code duplication between client.cpp and server.cpp
+    // change the delimiter to \r\n ?
     addrinfo hints = {};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -249,7 +251,7 @@ int main(int argc, const char* const * const argv)
 
                 ++end;
 
-                printf("received msg: '%s'\n", begin);
+                //printf("received msg: '%s'\n", begin);
 
                 int cmd = 0;
                 for(int i = 1; i < Cmd::_count; ++i)
@@ -257,7 +259,7 @@ int main(int argc, const char* const * const argv)
                     const char* const cmdStr = getCmdStr(i);
                     const int cmdLen = strlen(cmdStr);
 
-                    if(int(strlen(begin)) >= cmdLen)
+                    if(cmdLen > int(strlen(begin)))
                         continue;
 
                     if(strncmp(begin, cmdStr, cmdLen) == 0)
@@ -275,7 +277,7 @@ int main(int argc, const char* const * const argv)
                         break;
 
                     case Cmd::Ping:
-                        addMsg(sendBuf, cmd);
+                        addMsg(sendBuf, Cmd::Pong);
                         break;
 
                     case Cmd::Pong:
