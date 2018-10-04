@@ -64,19 +64,10 @@ void addMsg(Array<char>& buffer, int cmd, const char* payload = "")
 static volatile int gExitLoop = false;
 void sigHandler(int) {gExitLoop = true;}
 
-int main(int argc, const char* const * const argv)
+// returns socket descriptior, -1 if failed
+// if succeeded you have to free the socket yourself
+int connect()
 {
-    if(argc != 2)
-    {
-        printf("usage: client <name>\n");
-        return 0;
-    }
-
-    signal(SIGINT, sigHandler);
-
-    // @TODO(matiTechno): client should be able to reconnect in the main loop
-    // remove code duplication between client.cpp and server.cpp
-    // change the delimiter to \r\n ?
     addrinfo hints = {};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -88,7 +79,7 @@ int main(int argc, const char* const * const argv)
         if(ec != 0)
         {
             printf("getaddrinfo() failed: %s\n", gai_strerror(ec));
-            return 0;
+            return -1;
         }
     }
 
@@ -121,14 +112,14 @@ int main(int argc, const char* const * const argv)
     if(it == nullptr)
     {
         printf("connection procedure failed\n");
-        return 0;
+        return -1;
     }
 
     if(fcntl(sockfd, F_SETFL, O_NONBLOCK) == -1)
     {
         close(sockfd);
         perror("fcntl() failed");
-        return 0;
+        return -1;
     }
 
     {
@@ -137,42 +128,91 @@ int main(int argc, const char* const * const argv)
         {
             close(sockfd);
             perror("setsockopt() (TCP_NODELAY) failed");
-            return 0;
+            return -1;
         }
     }
+
+    return sockfd;
+}
+
+int main(int argc, const char* const * const argv)
+{
+    if(argc != 2)
+    {
+        printf("usage: client <name>\n");
+        return 0;
+    }
+
+    signal(SIGINT, sigHandler);
+
+    // remove code duplication between client.cpp and server.cpp
+    // change the delimiter to \r\n ?
 
     Array<char> sendBuf, recvBuf;
     int recvBufNumUsed = 0;
     sendBuf.reserve(500);
     recvBuf.resize(500);
-    bool serverAlive = true;
+    bool serverAlive;
     double currentTime = getTimeSec();
-    float timerAlive = 0.f, timerSend = 0.f;
+    const float timerAliveMax = 5.f;
+    const float timerReconnectMax = 5.f;
+    float timerAlive, timerSend, timerReconnect = timerReconnectMax;
+    bool hasToReconnect = true;
+    int sockfd = -1;
 
-    // send the player name
-    {
-        char name[20];
-        int maxNameSize = sizeof(name) - 1;
-
-        if(int(strlen(argv[1])) > maxNameSize)
-            printf("WARNING: max player name size is %d, truncating\n", maxNameSize);
-
-        snprintf(name, sizeof(name), "%s", argv[1]);
-        addMsg(sendBuf, Cmd::Name, name);
-    }
-
-    //@TODO(matiTechno): never exit the loop on error (always try to reconnect)
     while(gExitLoop == false)
     {
-        // update
+        // time managment
         {
             double newTime = getTimeSec();
             const float dt = newTime - currentTime;
             currentTime = newTime;
             timerAlive += dt;
             timerSend += dt;
+            timerReconnect += dt;
+        }
 
-            if(timerAlive > 5.f)
+        if(hasToReconnect)
+        {
+            if(timerReconnect >= timerReconnectMax)
+            {
+                timerReconnect = 0.f;
+
+                if(sockfd != -1)
+                    close(sockfd);
+
+                sockfd = connect();
+
+                if(sockfd != -1)
+                {
+                    serverAlive = true;
+                    timerAlive = timerAliveMax;
+                    timerSend = 5.f;
+                    hasToReconnect = false;
+                    sendBuf.clear();
+
+                    // send the player name
+                    {
+                        char name[20];
+                        int maxNameSize = sizeof(name) - 1;
+
+                        if(int(strlen(argv[1])) > maxNameSize)
+                        {
+                            printf("WARNING: max player name size is %d, truncating\n",
+                                    maxNameSize);
+                        }
+
+                        snprintf(name, sizeof(name), "%s", argv[1]);
+                        addMsg(sendBuf, Cmd::Name, name);
+                    }
+                }
+            }
+        }
+
+        // update
+        if(!hasToReconnect)
+        {
+            if(timerAlive > timerAliveMax)
             {
                 timerAlive = 0.f;
 
@@ -183,8 +223,8 @@ int main(int argc, const char* const * const argv)
                 }
                 else
                 {
-                    gExitLoop = true;
-                    printf("no PONG response from server\n");
+                    hasToReconnect = true;
+                    printf("no PONG response from server, will try to reconnect\n");
                 }
             }
 
@@ -196,39 +236,42 @@ int main(int argc, const char* const * const argv)
         }
 
         // receive
-        while(true)
+        if(!hasToReconnect)
         {
-            const int numFree = recvBuf.size() - recvBufNumUsed;
-            const int rc = recv(sockfd, recvBuf.data() + recvBufNumUsed, numFree, 0);
-
-            if(rc == -1)
+            while(true)
             {
-                if(errno != EAGAIN || errno != EWOULDBLOCK)
+                const int numFree = recvBuf.size() - recvBufNumUsed;
+                const int rc = recv(sockfd, recvBuf.data() + recvBufNumUsed, numFree, 0);
+
+                if(rc == -1)
                 {
-                    perror("recv() failed");
-                    gExitLoop = true;
+                    if(errno != EAGAIN || errno != EWOULDBLOCK)
+                    {
+                        perror("recv() failed");
+                        hasToReconnect = true;
+                    }
+                    break;
                 }
-                break;
-            }
-            else if(rc == 0)
-            {
-                printf("server has closed the connection\n");
-                gExitLoop = true;
-                break;
-            }
-            else
-            {
-                recvBufNumUsed += rc;
-
-                if(recvBufNumUsed < recvBuf.size())
-                    break;
-
-                recvBuf.resize(recvBuf.size() * 2);
-                if(recvBuf.size() > 10000)
+                else if(rc == 0)
                 {
-                    printf("recvBuf big size issue, exiting\n");
-                    gExitLoop = true;
+                    printf("server has closed the connection\n");
+                    hasToReconnect = true;
                     break;
+                }
+                else
+                {
+                    recvBufNumUsed += rc;
+
+                    if(recvBufNumUsed < recvBuf.size())
+                        break;
+
+                    recvBuf.resize(recvBuf.size() * 2);
+                    if(recvBuf.size() > 10000)
+                    {
+                        printf("recvBuf big size issue, exiting\n");
+                        gExitLoop = true;
+                        break;
+                    }
                 }
             }
         }
@@ -301,25 +344,26 @@ int main(int argc, const char* const * const argv)
         }
 
         // send
-        if(sendBuf.size())
+        if(!hasToReconnect && sendBuf.size())
         {
             const int rc = send(sockfd, sendBuf.data(), sendBuf.size(), 0);
 
             if(rc == -1)
             {
-                close(sockfd);
                 perror("send() failed");
-                return 0;
+                hasToReconnect = true;
             }
             else
                 sendBuf.erase(0, rc);
         }
-
+        
         // sleep for 10 ms
         usleep(10000);
     }
 
+    if(sockfd != -1)
+        close(sockfd);
+
     printf("end of the main function\n");
-    close(sockfd);
     return 0;
 }
